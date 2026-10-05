@@ -1,0 +1,101 @@
+name: Job Radar
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 08:07 and 18:07 Nigeria time (WAT = UTC+1)
+    - cron: '7 7 * * *'
+    - cron: '7 17 * * *'
+
+# Prevent two runs from modifying SQLite at the same time.
+concurrency:
+  group: job-radar-scan
+  cancel-in-progress: false
+
+# Required so GitHub Actions can commit the SQLite state.
+permissions:
+  contents: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: mbstring, sqlite3, pdo_sqlite
+          coverage: none
+
+      - name: Install dependencies
+        run: composer install --no-interaction --prefer-dist --no-progress
+
+      - name: Configure Laravel
+        env:
+          APP_KEY: ${{ secrets.APP_KEY }}
+          MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
+          MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
+          MAIL_FROM_ADDRESS: ${{ secrets.MAIL_FROM_ADDRESS }}
+          JOB_RADAR_TO: ${{ secrets.JOB_RADAR_TO }}
+
+        run: |
+          cp .env.example .env
+
+          # Persistent SQLite database.
+          mkdir -p database
+          touch database/database.sqlite
+
+          cat >> .env <<EOF
+          APP_ENV=production
+          APP_DEBUG=false
+
+          DB_CONNECTION=sqlite
+          DB_DATABASE=${GITHUB_WORKSPACE}/database/database.sqlite
+
+          MAIL_MAILER=smtp
+          MAIL_HOST=smtp.gmail.com
+          MAIL_PORT=465
+          MAIL_USERNAME=${MAIL_USERNAME}
+          MAIL_PASSWORD=${MAIL_PASSWORD}
+          MAIL_ENCRYPTION=ssl
+          MAIL_FROM_ADDRESS=${MAIL_FROM_ADDRESS}
+          MAIL_FROM_NAME=Job Radar
+
+          JOB_RADAR_TO=${JOB_RADAR_TO:-${MAIL_FROM_ADDRESS}}
+          EOF
+
+          # Use the GitHub secret if supplied.
+          # Otherwise Laravel generates an APP_KEY.
+          if [ -z "$APP_KEY" ]; then
+            php artisan key:generate --force
+          else
+            sed -i "s|^APP_KEY=.*|APP_KEY=${APP_KEY}|" .env
+          fi
+
+          php artisan config:clear
+          php artisan migrate --force
+
+      - name: Scan and send digest
+        run: php artisan job-radar:scan
+
+      - name: Persist SQLite deduplication state
+        if: success()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Laravel normally ignores SQLite files, so force-add this one.
+          git add -f database/database.sqlite
+
+          if git diff --cached --quiet; then
+            echo "No SQLite state changes to commit."
+          else
+            git commit -m "Persist Job Radar state"
+            git push
+          fi
